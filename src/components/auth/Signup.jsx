@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   Alert, Avatar, Button, Card, CardActions, CardContent, CardHeader, InputAdornment,
   Paper, Stack, TextField, Typography
@@ -11,26 +11,92 @@ import { userExists, saveCurrentSession, saveUserProgress } from '../../utils/st
 import { isEmail, isPhone } from '../../utils/validation'
 import { getInitialState } from '../../rootState.js'
 
+const DRAFT_KEY = 'signupDraft_v1'
+
 export default function Signup({ state, persist, setState }) {
   const [form, setForm] = useState({ name: '', email: '', mobile: '', password: '', confirm: '' })
   const [sending, setSending] = useState({ email: false, mobile: false })
   const [otp, setOtp] = useState({ email: '', mobile: '' })
   const [errors, setErrors] = useState({})
+  // Local sticky verified flags to survive remounts
+  const [verified, setVerified] = useState({ email: false, mobile: false })
+  const mounted = useRef(false)
 
-  const sendEmailOtp = () => { setSending(p=>({ ...p, email:true })); setTimeout(()=>setSending(p=>({ ...p, email:false })), 600) }
-  const sendMobileOtp = () => { setSending(p=>({ ...p, mobile:true })); setTimeout(()=>setSending(p=>({ ...p, mobile:false })), 600) }
+  // ---- draft persistence helpers ----
+  const saveDraft = (next = {}) => {
+    const payload = {
+      form,
+      otp,
+      verified,
+      ...next,
+    }
+    try { localStorage.setItem(DRAFT_KEY, JSON.stringify(payload)) } catch {}
+  }
+  const loadDraft = () => {
+    try {
+      const raw = localStorage.getItem(DRAFT_KEY)
+      if (!raw) return
+      const data = JSON.parse(raw)
+      if (data?.form) setForm(prev => ({ ...prev, ...data.form }))
+      if (data?.otp) setOtp(prev => ({ ...prev, ...data.otp }))
+      if (data?.verified) setVerified(prev => ({ ...prev, ...data.verified }))
+    } catch {}
+  }
+  const clearDraft = () => { try { localStorage.removeItem(DRAFT_KEY) } catch {} }
+
+  // Rehydrate once on mount
+  useEffect(() => {
+    if (mounted.current) return
+    mounted.current = true
+    loadDraft()
+  }, [])
+
+  // Keep local verified flags in sync with parent state (only from false -> true)
+  useEffect(() => {
+    if (state?.emailVerified && !verified.email) setVerified(v => ({ ...v, email: true }))
+    if (state?.mobileVerified && !verified.mobile) setVerified(v => ({ ...v, mobile: true }))
+  }, [state?.emailVerified, state?.mobileVerified])
+
+  // Save draft whenever anything important changes
+  useEffect(() => {
+    saveDraft()
+  }, [form, otp, verified])
+
+  // ---- OTP send/verify ----
+  const sendEmailOtp = () => {
+    setSending(p => ({ ...p, email: true }))
+    setTimeout(() => setSending(p => ({ ...p, email: false })), 600)
+  }
+  const sendMobileOtp = () => {
+    setSending(p => ({ ...p, mobile: true }))
+    setTimeout(() => setSending(p => ({ ...p, mobile: false })), 600)
+  }
 
   const verifyEmailOtp = () => {
-    if (otp.email === '123456') persist(s => ({ ...s, emailVerified: true }))
-    else setErrors(e => ({ ...e, emailOtp: 'Invalid OTP' }))
+    if (otp.email === '123456') {
+      // update parent + local sticky flag
+      persist(s => ({ ...s, emailVerified: true }))
+      setVerified(v => ({ ...v, email: true }))
+      setErrors(e => ({ ...e, emailOtp: undefined }))
+      saveDraft({ verified: { ...verified, email: true } })
+    } else {
+      setErrors(e => ({ ...e, emailOtp: 'Invalid OTP' }))
+    }
   }
   const verifyMobileOtp = () => {
-    if (otp.mobile === '654321') persist(s => ({ ...s, mobileVerified: true }))
-    else setErrors(e => ({ ...e, mobileOtp: 'Invalid OTP' }))
+    if (otp.mobile === '654321') {
+      persist(s => ({ ...s, mobileVerified: true }))
+      setVerified(v => ({ ...v, mobile: true }))
+      setErrors(e => ({ ...e, mobileOtp: undefined }))
+      saveDraft({ verified: { ...verified, mobile: true } })
+    } else {
+      setErrors(e => ({ ...e, mobileOtp: 'Invalid OTP' }))
+    }
   }
 
-  const canContinue = state.emailVerified && state.mobileVerified
+  const canContinue = (state?.emailVerified || verified.email) && (state?.mobileVerified || verified.mobile)
 
+  // ---- Continue ----
   const handleContinue = () => {
     const errs = {}
     if (!form.name) errs.name = 'Name required'
@@ -46,13 +112,22 @@ export default function Signup({ state, persist, setState }) {
     const fresh = getInitialState()
     const merged = {
       ...fresh,
-      userData: { ...fresh.userData, name: form.name, email: form.email, mobile: form.mobile, password: form.password },
+      userData: {
+        ...fresh.userData,
+        name: form.name,
+        email: form.email,
+        mobile: form.mobile,
+        password: form.password
+      },
       currentUser: form.email,
       currentStep: 'kyc',
+      emailVerified: true,
+      mobileVerified: true,
     }
     saveCurrentSession(form.email)
     saveUserProgress(form.email, merged)
     saveUserProgress(form.mobile, merged)
+    clearDraft() // ✅ done — remove draft so dashboard starts clean
     setState(merged)
   }
 
@@ -73,10 +148,21 @@ export default function Signup({ state, persist, setState }) {
             <TextField label="Full Name" value={form.name} error={!!errors.name} helperText={errors.name} onChange={e=>setForm({...form, name:e.target.value})} fullWidth/>
 
             <Stack direction={{ xs:'column', sm:'row' }} spacing={2}>
-              <TextField label="Email" value={form.email} error={!!errors.email} helperText={errors.email} onChange={e=>setForm({...form, email:e.target.value})} fullWidth InputProps={{ startAdornment: <InputAdornment position="start"><EmailIcon/></InputAdornment> }}/>
-              <Button onClick={sendEmailOtp} disabled={!isEmail(form.email) || state.emailVerified} color={state.emailVerified?'success':'primary'} variant={state.emailVerified?'contained':'outlined'} sx={{ minWidth: 140 }}>{sending.email?'Sending…': state.emailVerified?'Verified ✓':'Send OTP'}</Button>
+              <TextField
+                label="Email"
+                value={form.email}
+                error={!!errors.email}
+                helperText={errors.email}
+                onChange={e=>setForm({...form, email:e.target.value})}
+                fullWidth
+                InputProps={{ startAdornment: <InputAdornment position="start"><EmailIcon/></InputAdornment> }}
+              />
+              <Button onClick={sendEmailOtp} disabled={!isEmail(form.email) || verified.email} color={verified.email?'success':'primary'} variant={verified.email?'contained':'outlined'} sx={{ minWidth: 140 }}>
+                {sending.email?'Sending…': verified.email?'Verified ✓':'Send OTP'}
+              </Button>
             </Stack>
-            {!state.emailVerified && (
+
+            {!verified.email && (
               <Stack direction={{ xs:'column', sm:'row' }} spacing={2}>
                 <TextField label="Enter Email OTP (123456)" value={otp.email} onChange={e=>setOtp({...otp, email:e.target.value})} error={!!errors.emailOtp} helperText={errors.emailOtp} fullWidth/>
                 <Button onClick={verifyEmailOtp} disabled={!otp.email}>Verify</Button>
@@ -84,10 +170,21 @@ export default function Signup({ state, persist, setState }) {
             )}
 
             <Stack direction={{ xs:'column', sm:'row' }} spacing={2}>
-              <TextField label="Mobile" value={form.mobile} error={!!errors.mobile} helperText={errors.mobile} onChange={e=>setForm({...form, mobile:e.target.value.replace(/[^0-9]/g,'').slice(0,10)})} fullWidth InputProps={{ startAdornment: <InputAdornment position="start"><PhoneIcon/></InputAdornment> }}/>
-              <Button onClick={sendMobileOtp} disabled={!isPhone(form.mobile) || state.mobileVerified} color={state.mobileVerified?'success':'primary'} variant={state.mobileVerified?'contained':'outlined'} sx={{ minWidth: 140 }}>{sending.mobile?'Sending…': state.mobileVerified?'Verified ✓':'Send OTP'}</Button>
+              <TextField
+                label="Mobile"
+                value={form.mobile}
+                error={!!errors.mobile}
+                helperText={errors.mobile}
+                onChange={e=>setForm({...form, mobile:e.target.value.replace(/[^0-9]/g,'').slice(0,10)})}
+                fullWidth
+                InputProps={{ startAdornment: <InputAdornment position="start"><PhoneIcon/></InputAdornment> }}
+              />
+              <Button onClick={sendMobileOtp} disabled={!isPhone(form.mobile) || verified.mobile} color={verified.mobile?'success':'primary'} variant={verified.mobile?'contained':'outlined'} sx={{ minWidth: 140 }}>
+                {sending.mobile?'Sending…': verified.mobile?'Verified ✓':'Send OTP'}
+              </Button>
             </Stack>
-            {!state.mobileVerified && (
+
+            {!verified.mobile && (
               <Stack direction={{ xs:'column', sm:'row' }} spacing={2}>
                 <TextField label="Enter Mobile OTP (654321)" value={otp.mobile} onChange={e=>setOtp({...otp, mobile:e.target.value})} error={!!errors.mobileOtp} helperText={errors.mobileOtp} fullWidth/>
                 <Button onClick={verifyMobileOtp} disabled={!otp.mobile}>Verify</Button>
@@ -99,7 +196,9 @@ export default function Signup({ state, persist, setState }) {
               <TextField type="password" label="Confirm Password" value={form.confirm} error={!!errors.confirm} helperText={errors.confirm} onChange={e=>setForm({...form, confirm:e.target.value})} fullWidth/>
             </Stack>
 
-            <Alert severity={canContinue?'success':'info'}>{canContinue?'Email & Mobile verified. You can continue.':'Verify both Email and Mobile to continue.'}</Alert>
+            <Alert severity={canContinue?'success':'info'}>
+              {canContinue ? 'Email & Mobile verified. You can continue.' : 'Verify both Email and Mobile to continue.'}
+            </Alert>
           </Stack>
         </CardContent>
         <CardActions sx={{ p: 3 }}>
